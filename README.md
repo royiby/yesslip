@@ -8,8 +8,8 @@ This file is the state of the code. The product plan is kept privately.
 
 ## Where this is up to
 
-Phase 1 of the plan, part way. The multi-tenant foundation and Google login are
-in and tested; no customer-facing surface has been ported yet.
+Phase 1 of the plan, part way. The multi-tenant foundation, Google login and the
+parent-facing booking surface are in and tested. The operator app is next.
 
 | Piece | File | What it settles |
 |---|---|---|
@@ -23,9 +23,15 @@ in and tested; no customer-facing surface has been ported yet.
 | Sessions | `src/auth/session.js` | Signed cookies. No sessions table; see below. |
 | Users, roles, invitations | `src/auth/store.js` | Memberships as the authorisation, invitations stored as hashes. |
 | Guards and routes | `src/auth/routes.js` | `requireUser`, `requireTenant({ role })`, and the login round trip. |
+| Program config | `src/programs/camp.js`, `store.js` | Days, prices and consent wording per tenant, with history and a working undo. |
+| Pricing | `src/pricing.js` | Daily and weekly tariffs, the weekly ceiling, the sibling discount. Pure. |
+| Signed documents | `src/storage/`, `src/consent/` | Consents rendered self-contained and written once to S3-compatible object storage. |
+| Registrations | `src/store/registrations.js` | Capacity, orders, attendance. The oversell race is closed. |
+| The booking page | `src/booking/` | `/b/:slug`: pick days, sign, pay. One vanilla script, no build step. |
+| Branding | `src/lib/palette.js` | Each business's two colours, with the text colour on top computed, not chosen. |
 
-**Not started:** the booking page, the operator app, contracts, consents to R2,
-live config editing, the Sheets mirror, branding, billing.
+**Not started:** the operator app, contracts, cancellations and refunds, live
+config editing from a screen, the Sheets mirror, billing.
 
 ## Three things worth knowing before reading the code
 
@@ -42,7 +48,13 @@ supplies the token for every later call: one business reading another's
 invoices, with every response looking valid. A `let` at module scope in
 `src/morning/client.js` reintroduces that bug.
 
-**3. A session says who, never what.** The cookie carries a user id and an
+**3. A booking page has no session at all.** `/b/:slug` and `/webhooks` are
+reached by parents with a link, not an account. The tenant comes from the path;
+nothing else decides which business a request acts on. That makes those two the
+places to look hardest, and why the week ids, the consent key and the webhook
+secret are all resolved per tenant rather than trusted from the request.
+
+**4. A session says who, never what.** The cookie carries a user id and an
 issue time. Which businesses that user may act for, and in what role, is read
 from `memberships` on every request. The cost is one indexed read; the benefit
 is that "remove this person from my business" takes effect on their next click
@@ -68,13 +80,20 @@ APIs & Services, Credentials, Web application) with
 `<PUBLIC_BASE_URL>/auth/google/callback` as an authorised redirect URI, and
 `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` set. The tests do not need it.
 
+Signed consents go to any S3-compatible bucket (Cloudflare R2, Backblaze B2,
+MinIO, S3). With `OBJECT_STORE_*` unset they are held in memory and lost on
+restart, which the boot log says out loud. See `.env.example`.
+
 `npm run db:psql` opens a shell on the dev database. `npm start` runs the
-server; only `/auth/*` and `/health` exist so far.
+server. A tenant's booking page is at `/b/<slug>`, and it needs a program
+config and a connected Morning account before it will take a booking.
 
 ## Tests
 
-111 tests, all passing. They need the database up and migrated, and they do not
+220 tests, all passing. They need the database up and migrated, and they do not
 mock it, because much of what is under test is the database's own enforcement.
+Morning and the object store are stubbed at the network boundary rather than by
+swapping a module, so the real client code runs.
 
 | File | Proves |
 |---|---|
@@ -86,6 +105,14 @@ mock it, because much of what is under test is the database's own enforcement.
 | `test/auth-session.test.js` | A re-encoded payload with the original signature is refused; expiry lives inside the signed payload, not in `Max-Age`; `Secure` only on https; cookie parsing is not a prefix match. |
 | `test/auth-store.test.js` | The Google subject is the identity, not the email; the last owner cannot be removed or demoted; invitations are single-use, replaceable, expiring, and stored only as hashes. |
 | `test/auth-routes.test.js` | Open redirects are refused, including `//host` and backslash forms; the callback requires a matching state; a non-member gets 404 and a member without the role gets 403. |
+| `test/pricing.test.js` | Four days never cost more than five; the sibling discount skips the first child; the invoice lines add up to what is charged. |
+| `test/camp.test.js` | A weekly price that is not a discount is refused; a date not on the calendar is refused; editing a price does not change `termsVersion` and editing a term does. |
+| `test/programs.test.js` | An invalid edit does not replace the live config; undo walks back through saves rather than toggling the last two; one tenant cannot read another's program. |
+| `test/registrations.test.js` | Two simultaneous bookings cannot both take the last seat; an abandoned link releases its seats; a redelivered callback does not double-write attendance; a patch cannot touch `tenant_id`. |
+| `test/objects.test.js` | A document is written once; a key cannot climb out of its tenant prefix; `If-None-Match: *` is on the wire; a 412 is already-signed and a 403 is not. |
+| `test/consent.test.js` | A renamed payload is not a PNG; the document carries the terms version and the IP and fetches nothing; signing twice is refused; two tenants can hold the same order id. |
+| `test/booking-routes.test.js` | Another business's week id does not exist here; the webhook refuses a wrong secret and another tenant's secret; the rate limit is per business; a business with no Morning account cannot take a signature. |
+| `test/palette.test.js` | Every hue clears WCAG AA on its own button, including the ones that need the brand colour darkened to get there. |
 
 ## Decisions already made, and why
 
@@ -116,6 +143,47 @@ received directly from the token endpoint over TLS. Thirty lines is cheap at
 the one boundary where being wrong means signing in as somebody else, and it
 also catches a misconfigured token endpoint.
 
+**Capacity is checked inside the transaction, under a per-tenant advisory
+lock.** The original read the sheet to count seats, then appended rows, with a
+Google Sheets round trip in between; two parents could both be sold the last
+seat, and registration opens at a published time with everybody arriving at
+once. The count and the insert are now one transaction, serialised per tenant
+so one business's rush does not queue behind another's. The test for this
+originally passed for the wrong reason: connection-setup latency was
+serialising the two bookings, so the lock was never exercised. With the pool
+pre-warmed, removing the lock puts three children on a two-seat day on every
+run, which is what the test now asserts.
+
+**Signed documents are write-once, with three barriers rather than one claim.**
+The original relied on `open(2)` with `O_EXCL`; a single flag was what stopped a
+form being signed twice. The equivalent here is a conditional PUT
+(`If-None-Match: *`), which S3 and R2 answer with 412. But a provider that
+ignored the header would permit an overwrite and this code could not tell, so
+the HEAD before it stays, and `consents` carries `UNIQUE (tenant_id, order_id)`
+underneath both. Saying "it is immutable" would have been a claim the storage
+layer cannot keep on its own.
+
+**The document is written before the rows, and the payment link after both.**
+A signed form with no registration is an orphan the retention sweep collects. A
+registration with no form is a business holding money for something nobody
+signed. Only one of those is recoverable, so the order is not an accident.
+
+**The text colour on a tenant's brand is computed, not chosen.** A business
+picks a colour because it matches their logo. Pale yellow is a reasonable brand
+colour and a terrible button background for white text, so `src/lib/palette.js`
+picks whichever of near-black and white has the better WCAG ratio. Some colours
+cannot carry readable text at all: pure red is 4.00:1 against white and 4.55:1
+against near-black, so neither clears AA for a button label, and the colour
+itself is darkened along its own hue until one does. That overrides what the
+business chose, so the palette reports `adjusted` and a settings screen can say
+so.
+
+**The tenant is a path prefix, not a subdomain.** `/b/:slug` needs one
+certificate. A subdomain needs a wildcard certificate, a wildcard DNS record
+and, for custom domains, Cloudflare for SaaS. Nothing below the router knows how
+the tenant was resolved, so it can become a subdomain later without touching the
+booking code.
+
 **Express 4, matching the source.** Express 5 changed path syntax and query
 handling; porting 1000+ lines of existing routes onto it while also making them
 multi-tenant is two risky changes at once. The upgrade is its own task.
@@ -128,6 +196,5 @@ dependencies and no framework.
 
 ## Next
 
-Port the booking surface for one tenant, then consents to R2, then the operator
-app. The Phase 1 checkpoint is Yetziron running on this stack as tenant #1 with
-no change she can notice.
+The operator app, then contracts and cancellations. The Phase 1 checkpoint is
+Yetziron running on this stack as tenant #1 with no change she can notice.

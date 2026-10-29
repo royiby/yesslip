@@ -192,6 +192,32 @@ export async function revealMorningCredentials(tenantId) {
   });
 }
 
+/**
+ * Just the webhook secret. A second function that returns a live secret, which
+ * is a change to the property the comment above describes, so here is the
+ * reason: every booking needs this one to build a notifyUrl, and every payment
+ * callback needs it to verify. Handing those paths the Morning API key and
+ * secret as well would mean the two most-travelled code paths in the system
+ * routinely hold the credentials that can issue invoices and take refunds.
+ *
+ * Narrowing what a frequent caller receives is the opposite of widening the
+ * surface. revealMorningCredentials stays the only way to the API keys.
+ */
+export async function revealWebhookSecret(tenantId) {
+  return platform(async (client) => {
+    const { rows } = await client.query(
+      `SELECT c.webhook_secret_enc, t.dek_wrapped
+         FROM tenant_connections c JOIN tenants t ON t.id = c.tenant_id
+        WHERE c.tenant_id = $1 AND c.provider = 'morning'`,
+      [tenantId],
+    );
+    const row = rows[0];
+    if (!row) return null;
+    return decryptSecret(unwrapDek(row.dek_wrapped), row.webhook_secret_enc,
+      tenantId, 'morning.webhook_secret');
+  });
+}
+
 /** Connection state without any secret in it. Safe for the settings screen. */
 export async function getMorningConnectionStatus(tenantId) {
   return platform(async (client) => {

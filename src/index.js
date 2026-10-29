@@ -1,12 +1,23 @@
 import 'dotenv/config';
 import express from 'express';
 import { makeAuthRouter } from './auth/routes.js';
+import { makeBookingRouter, makeWebhookRouter } from './booking/routes.js';
 import { getPool, closePool } from './db/index.js';
+import { objectStore } from './storage/objects.js';
 import { log } from './lib/logger.js';
 
 /**
- * The server. Only auth is wired so far; the booking, operator and contract
- * surfaces are still to be ported, each behind requireTenant.
+ * The server.
+ *
+ * Two kinds of surface, and the difference is the whole security model:
+ *
+ *   /auth and (later) /app are signed in. A session says who, memberships say
+ *   which businesses, and every tenant table is reached through withTenant.
+ *
+ *   /b/:slug and /webhooks are public and have no session at all. A parent has
+ *   a link, not an account. The tenant comes from the path, and nothing but the
+ *   path and a per-tenant webhook secret decides which business a request acts
+ *   on, which is why those two are the places to look hardest.
  */
 
 export function makeApp() {
@@ -23,10 +34,19 @@ export function makeApp() {
 
   app.use('/auth', makeAuthRouter());
 
+  // Public, no session. See the note above.
+  app.use('/b', makeBookingRouter());
+  app.use('/webhooks', makeWebhookRouter());
+
   app.get('/health', async (_req, res) => {
     try {
       await getPool().query('SELECT 1');
-      res.json({ ok: true, db: 'up' });
+      // The document store is reported rather than probed. A HEAD on every
+      // health check costs a request per minute per instance for an answer
+      // that only changes on deploy; what actually matters here is whether a
+      // bucket is configured at all, because "memory" means signed consents
+      // are being kept somewhere they will not survive a restart.
+      res.json({ ok: true, db: 'up', documents: objectStore().kind });
     } catch (error) {
       // 503, so a platform health check actually fails rather than reporting a
       // cheerful 200 with bad news in the body.
@@ -45,6 +65,9 @@ export function makeApp() {
 
 if (import.meta.url === `file://${process.argv[1]}`) {
   const port = Number(process.env.PORT ?? 3000);
+  // Called at boot, not on the first signature, so an unconfigured bucket is
+  // one warning in the deploy log rather than a line per parent.
+  objectStore();
   const server = makeApp().listen(port, () => log.info('server.listening', { port }));
 
   for (const signal of ['SIGTERM', 'SIGINT']) {
