@@ -1,0 +1,11 @@
+node_modules/
+.env
+.env.*
+!.env.example
+data/
+*.log
+.DS_Store
+service-account*.json
+
+# Business strategy, competitor read and open decisions. Deliberately not public.
+PLAN.md

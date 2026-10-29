@@ -1,0 +1,25 @@
+{
+  "name": "yesslip",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Multi-tenant registration, signed consent and Morning payments for small businesses",
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js",
+    "test": "node --import dotenv/config --test test/*.test.js",
+    "migrate": "node src/db/migrate.js",
+    "db:up": "docker start yesslip-pg || docker run -d --name yesslip-pg -e POSTGRES_PASSWORD=yesslip -e POSTGRES_USER=yesslip -e POSTGRES_DB=yesslip -p 5433:5432 postgres:18-alpine",
+    "db:down": "docker stop yesslip-pg",
+    "db:psql": "docker exec -it yesslip-pg psql -U yesslip -d yesslip",
+    "keygen": "node -e \"console.log(require('node:crypto').randomBytes(32).toString('base64'))\""
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "express": "^4.21.2",
+    "pg": "^8.13.1"
+  }
+}
