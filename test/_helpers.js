@@ -26,6 +26,18 @@ export async function dropTenant(id) {
   await platform((client) => client.query('DELETE FROM tenants WHERE id = $1', [id]));
 }
 
+export async function dropUser(id) {
+  if (!id) return;
+  await platform((client) => client.query('DELETE FROM users WHERE id = $1', [id]));
+}
+
+export async function makeUser(suffix = crypto.randomBytes(4).toString('hex')) {
+  const { upsertUserFromGoogle } = await import('../src/auth/store.js');
+  return upsertUserFromGoogle({
+    sub: `google-${suffix}`, email: `user-${suffix}@example.com`, name: 'משתמש בדיקה',
+  });
+}
+
 export { closePool };
 
 /** A fetch stand-in that records calls and replays queued responses. */
